@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-import org.hiero.gradle.extensions.CargoToolchain
 import org.hiero.gradle.tasks.CargoBuildTask
 import org.hiero.gradle.tasks.GitClone
 
@@ -13,13 +12,13 @@ plugins {
 
 cargo {
     libname = "wraps"
-    appname = "ceremony"
 }
 
 val prepareHalo2curves =
     tasks.register<GitClone>("prepareHalo2curves") {
         url = "https://github.com/privacy-ethereum/halo2curves.git"
-        tag = "v0.9.0"
+        // The commit hash corresponding to the v0.9.0 tag as of 2026-10-14:
+        tag = "4b7a69e6a3f1878b150c212d73ec82a3210c29f9"
         patches.from(
             layout.projectDirectory.file("src/main/rust/nova-wraps/halo2curves-v0.9.0.patch")
         )
@@ -56,21 +55,35 @@ tasks.test {
     )
 }
 
-// Build `ceremony` in the current -wraps module, and make it available for the -ceremony build to
-// consume:
-tasks.processResources { exclude("com/hedera/nativelib/ceremony/**") }
+// add a feature variant that excludes '*.ptau' files
+val verifierSourceSet = sourceSets.create("verifier")
 
-// export native binaries built with rust as separate artifacts
-configurations.consumable("nativeBinElements") {
-    attributes.attribute(Usage.USAGE_ATTRIBUTE, objects.named("native-bin"))
-    CargoToolchain.entries.forEach { target ->
-        // The below if conditions should be added once this is integrated:
-        // https://github.com/hiero-ledger/hiero-gradle-conventions/pull/416
-        // if (packageAllTargets || (target.os == hostOs() && target.arch == hostArch()))
-        outgoing.artifact(
-            tasks
-                .named<CargoBuildTask>("cargoBuild${target.name.replaceFirstChar(Char::titlecase)}")
-                .flatMap { it.destinationDirectory }
-        )
+java.registerFeature(verifierSourceSet.name) {
+    val variantArtifactName = "${project.name}-${verifierSourceSet.name}"
+    usingSourceSet(verifierSourceSet)
+    // the 'verifier' variant has the 'main' capability as both are mutually exclusive:
+    capability(project.group.toString(), project.name, project.version.toString())
+    // the 'verifier' variant can be selected through its own 'capability':
+    capability(project.group.toString(), variantArtifactName, project.version.toString())
+}
+
+val verifierJarTask = tasks.named<Jar>(verifierSourceSet.jarTaskName)
+
+verifierJarTask {
+    from(sourceSets.main.get().output) // same code as 'main' variant...
+    exclude("**/*.ptau") // ...but with large 'ptau' file excluded
+    manifest {
+        attributes["Implementation-Title"] = project.name
+        attributes["Implementation-Version"] = project.version
     }
+}
+
+configurations {
+    // the additional variant has the same dependencies as the 'main' variant
+    named(verifierSourceSet.apiElementsConfigurationName) { extendsFrom(apiElements.get()) }
+    named(verifierSourceSet.runtimeElementsConfigurationName) { extendsFrom(runtimeElements.get()) }
+}
+
+tasks.assemble {
+    dependsOn(verifierJarTask)
 }

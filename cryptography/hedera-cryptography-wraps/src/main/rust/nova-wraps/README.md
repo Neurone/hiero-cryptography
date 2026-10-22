@@ -29,7 +29,7 @@ require regenerating public parameters, prover/verifier keys, and proofs; existi
 powers-of-tau files can be reused.
 
 Use `WRAPS` with the public address-book, signing, and key types.
-Proofs, compact verification keys, rotation messages, and signing-round messages use
+Proofs, serialized verification keys, rotation messages, and signing-round messages use
 `Vec<u8>` for transport. Verifier setup derives a retained `CompressedVerifyingKey`
 from public parameters; verification borrows that prepared object.
 Padding, signing-subset selection, and the underlying cryptographic helpers are
@@ -63,10 +63,10 @@ hash directly.
 | `examples/stats.rs` | three linked rotations signed by 2-of-3 committees, with serialization checks throughout and final tables of individual type sizes and WRAPS method timings |
 
 The demo uses the library's shared `encode` and `decode` helpers and feeds decoded
-values into signing, proof construction, and verification. The public parameters and
-compact verification-key bytes are round-tripped once. The parameters are reused
-for proving and running-proof verification; the prepared compressed verifier is
-retained for all rotations. It reports one representative member's key generation
+values into signing, proof construction, and verification. The verification-key
+bytes are round-tripped once. Between rotations, it restores the public parameters
+and running state from a serialized checkpoint and derives a fresh compressed
+verifier. It reports one representative member's key generation
 and signing arguments per book/phase, and the complete round broadcasts as encoded
 `RoundMessage` bytes.
 Reported return sizes cover successful payloads; raw proof and verifier-key sizes
@@ -96,13 +96,13 @@ directly through Nova. Once prepared, that key owns everything needed for compre
 verification and does not retain a reference to the public parameters:
 
 ```rust
-use wraps::{CompressedVerifyingKey, PublicParams, WRAPS};
+use wraps::{decode, encode, CompressedVerifyingKey, PublicParams, WRAPS};
 
 let pp: PublicParams = WRAPS::load_public_params(&ptau_dir)?;
-let compact_vk: Vec<u8> = WRAPS::get_compressed_verification_key(&pp)?;
+let serialized_vk: Vec<u8> = encode(&WRAPS::setup_compressed_verifier(&pp)?)?;
 
-// On a compressed verifier, prepare once and retain the key across proof checks.
-let compressed_vk: CompressedVerifyingKey = WRAPS::setup_compressed_verifier(&pp)?;
+// Deserialize the exported key and retain it across compressed proof checks.
+let compressed_vk: CompressedVerifyingKey = decode(&serialized_vk)?;
 let ledger_id = WRAPS::compute_rotation_message(&genesis_ab, &genesis_hints_vk)?;
 
 let (running, compressed) = WRAPS::construct_wraps_proof(
@@ -117,36 +117,37 @@ let compressed_valid = WRAPS::verify_compressed_wraps_proof(
 )?;
 ```
 
-The compact verification key is **778 bytes** for the current circuit and encoding.
-Of these, **288 bytes are application-specific**; the remaining bytes carry the
-format metadata, dimensions, and small fixed or KZG setup values needed for
-reconstruction. This is the transport size, not the prepared key's memory use.
+The serialized verification key is **4,738,776 bytes** for the current circuit and
+encoding. It contains the full Nova verifier key, including Poseidon constants and
+the secondary IPA basis. "Compressed" refers to the proof this key verifies; the
+key itself uses ordinary bincode encoding without additional compression.
+This replaces the former 778-byte compact descriptor; regenerate exported
+verification-key bytes when updating from that format.
 
 `setup_compressed_verifier(&pp)` uses Nova's setup directly, including the Poseidon
 constants and the secondary IPA basis of **131,072 message generators** already
 held in the parameters. It derives the compression keys and retains the verifier
 key. Keep the returned object and pass it by reference to repeated verification calls.
-`CompressedVerifyingKey` does not implement Serde. To prepare a verifier in another
-process, load or deserialize `PublicParams` there and call `setup_compressed_verifier`.
+`CompressedVerifyingKey` implements Serde and supports `encode` and `decode`. To
+prepare a verifier in another process, deserialize its exported bytes, or load or
+deserialize `PublicParams` there and call `setup_compressed_verifier`.
 Uncompressed verification uses `&PublicParams` directly; those parameters support
 `encode` and `decode`, with no separate verifier setup or wrapper.
 
-`get_compressed_verification_key(&pp)` remains available as a separate export.
-The crate has no compact-byte importer. The mirror structures and serialization
-logic in `verification_key.rs` are used only by that export, which checks that the
-omitted constants and IPA generators match the fixed defaults.
+Serialize the `CompressedVerifyingKey` returned by `setup_compressed_verifier(&pp)`
+with `encode`. Its transparent Serde wrapper preserves the underlying Nova
+verifier-key encoding.
 
 The public API has no separate prover-key setup. `construct_wraps_proof` derives
 Nova's prover and compressed verifier keys together on every call, so its runtime
 includes that setup cost. Its internal compressed check uses the derived key
-directly, without exporting or importing the compact format.
+directly, without serializing or deserializing the verifier key.
 
 `CompressedWrapsProof` is Nova's compressed SNARK, serialized directly with `encode`
 using bincode. Its byte length is deterministic for a fixed circuit shape; there is
-no additional zlib compression. Compact verification keys use a separate versioned
-format. The export's internal Serde bridge reads the private verifier-key layout
-of the pinned Nova 0.76.0 implementation; a Nova upgrade requires reviewing that
-bridge and the compact format together.
+no additional zlib compression. Verification keys also use ordinary bincode and
+Nova's own Serde implementation. Their encoding depends on the pinned Nova 0.76.0
+version and feature layout; review serialization compatibility when upgrading Nova.
 
 The MicroSpartan/Mercury configuration uses different compression and commitment-key
 sizes from the previous ordinary-Spartan/HyperKZG configuration. Parameters, keys,
@@ -177,14 +178,15 @@ It checks serialization round trips with `encode` and `decode` throughout all th
 rotations. Only the last rotation prints a size report: one row per named type or
 struct, with separate enum variants where their sizes differ. This includes full
 public parameters, signing payloads, and transport messages.
-A separate table reports raw proof and compact verification-key payload sizes
-exposed by the API as `Vec<u8>`. Prepared verifier objects are retained locally and
-have no serialized-size entry.
+A separate table reports raw proof payload sizes and the size of the verification
+key serialized by the example. The prepared verifier is retained locally for reuse;
+its serialized size is represented by the verification-key payload entry.
 Both size tables use decimal KB (`1 KB = 1000 bytes`) with three decimal places.
 
 The final timing table lists calls, total milliseconds, and mean milliseconds for
-each `WRAPS` method the example invokes. Public-parameter loading, compact-key
-derivation, and compressed-verifier setup are each timed separately once.
+each `WRAPS` method the example invokes. Public-parameter loading and
+compressed-verifier setup are each timed separately once. The example serializes
+the retained verifier outside the timed setup call.
 Proof-construction timing includes internal key derivation and both proof checks.
 Per-rotation calls are measured on the third rotation. Timings cover the library call, including
 its internal work, and exclude the example's serialization checks, random input
@@ -260,8 +262,11 @@ same selected signer's key and nonce. Aggregation checks every partial signature
 Malformed encodings, wrong round tags, trailing bytes, and incorrect message counts
 are rejected. Entropy is required in R1, R2, and R3; it is optional and ignored in
 Aggregate. A signing key is required in R3 and is optional and ignored in R1, R2, and
-Aggregate. Every phase validates the signing book and rejects bits selecting seats
-outside that book. R2 onward also requires at least one selected nonidentity key.
+Aggregate. Every phase requires a valid encoded two-field rotation message, including
+R1 and R2. A signer must supply the same entropy and message throughout R1, R2, and
+R3, because both inputs determine its nonce. Every phase validates the signing book
+and rejects bits selecting seats outside that book. R2 onward also requires at least
+one selected nonidentity key.
 Round messages follow the selected nonidentity keys in address-book order, skipping
 sentinel seats even when their bit is set.
 
@@ -367,6 +372,17 @@ secret key and `SHA256(seed || 0x01)` for the PoK nonce. Each digest seeds a sep
 ChaCha20 stream, so the entire attested key is reproducible from the input seed.
 The counters are single bytes. This expansion changes the key derived from a given
 seed compared with the previous direct-seed sampling.
+
+Signing nonces bind the signing-instance entropy to both fields of the rotation
+message. The protocol decodes the message, computes
+`SHA256(protocol_instance_entropy || canonical_field_encoding(message[0]) || canonical_field_encoding(message[1]))`,
+and uses that digest to seed ChaCha20 before sampling the nonce scalar. Field encodings
+are the canonical `PrimeField::to_repr` bytes, in message order, without a bincode
+envelope. Reuse the same entropy and message only across the three rounds of one
+signing instance. Each signer must choose fresh entropy for every new signing
+instance: the same entropy and message produce the same nonce even if the other
+signers or their round messages change. This changes signing transcripts, but does
+not change the circuit or require new Nova setup parameters.
 
 ## Signing: what a signer has to do itself
 

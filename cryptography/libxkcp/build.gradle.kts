@@ -10,8 +10,8 @@ plugins {
 }
 
 testModuleInfo {
-    requires("org.junit.jupiter.api")
     requires("org.bouncycastle.provider")
+    requires("org.junit.jupiter.api")
 }
 
 tasks.test {
@@ -147,6 +147,10 @@ abstract class BuildXKCPTask : DefaultTask() {
     // The os/arch tuple must appear twice in both outputDir and outputPath,
     // because that's how Gradle wants it...
     @get:Input abstract val outputPath: Property<String>
+
+    /// To make Gradle Cache happy, we're adding yet another input property that contains "os-arch".
+    /// Apparently, the `outputPath` below is insufficient for Gradle Cache to key an entry.
+    @get:Input abstract val targetId: Property<String>
 
     /// Where the binary library to be written.
     /// Likely build/third-party/<name>/output/<os>-<arch>.
@@ -300,6 +304,7 @@ targets.forEach { target ->
             makeArch = target.makeArch
             makeBin = target.makeBin
             makeArgs = target.makeArgs
+            targetId = "${target.os}-${target.arch}"
             outputDir = libOutputDir.get().dir("${target.os}-${target.arch}")
             outputPath = "com/hedera/nativelib/libxkcp/${target.os}/${target.arch}"
         }

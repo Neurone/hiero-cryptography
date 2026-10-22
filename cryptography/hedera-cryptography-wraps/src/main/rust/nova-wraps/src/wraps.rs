@@ -10,7 +10,6 @@ use crate::{
     SchnorrPublicKey, SchnorrResponse, SchnorrSecretKey, Signature,
   },
   utils::{decode, encode, encode_point, expand_seed, pad_bitvector, BitVector},
-  verification_key,
 };
 use ff::Field;
 use nova_snark::{
@@ -325,6 +324,9 @@ pub(crate) type NovaVerifierKey = nova::VerifierKey<E1, E2, C, S1, S2>;
 /// Derive this from public parameters with [`WRAPS::setup_compressed_verifier`].
 /// It owns its verification material and can outlive the parameters. Reuse it
 /// across proof checks to retain Nova's cached verifier-key digests.
+/// Supports [`encode`] and [`decode`] using the underlying Nova key's serialization.
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct CompressedVerifyingKey {
   pub(crate) inner: NovaVerifierKey,
 }
@@ -465,10 +467,10 @@ impl WRAPS {
   /// Executes a single phase of the three-round signing protocol.
   ///
   /// `protocol_instance_entropy` is per signer, per instance: the caller passes the same
-  /// value through R1, R2 and R3 of one rotation — the rounds are stateless and each
-  /// re-derives the signer's nonce from it — and a fresh one for the next rotation.
-  /// Reusing a seed across rotations repeats the nonce; signatures under different
-  /// challenges can then reveal the signer's secret key.
+  /// entropy and message through R1, R2 and R3 of one rotation. The rounds are stateless
+  /// and each re-derives the signer's nonce from SHA256(entropy || canonical message
+  /// field encodings). Use fresh entropy for every signing instance: reusing both
+  /// inputs repeats the nonce, and different shared challenges can reveal the key.
   ///
   /// Every phase works over the *signing subset* named by `bitvector`, never the whole
   /// address book — including the challenge derived in R3, which has to match the joint
@@ -476,7 +478,7 @@ impl WRAPS {
   ///
   /// # `message_to_sign` must come from [`WRAPS::compute_rotation_message`]
   ///
-  /// R3 and Aggregate decode the two field elements from the supplied bytes and cannot
+  /// Every phase decodes the two field elements from the supplied bytes and cannot
   /// look behind them. [`WRAPS::compute_rotation_message`] validates the book being
   /// endorsed before hashing it. That check establishes — for the whole rotation *after* this one —
   /// that every non-identity key is unique and came with a proof of possession. The
@@ -488,7 +490,8 @@ impl WRAPS {
   /// from a proposer or another signer silently drops that check, and there is nothing
   /// downstream that can notice.
   ///
-  /// R1 needs entropy and empty round-message lists; the book and message may be empty.
+  /// Every phase requires a valid encoded rotation message. R1 needs entropy and empty
+  /// round-message lists; the book may be empty.
   /// R2 needs all R1 messages. R3 needs all R1/R2 messages and the caller's signing key.
   /// Aggregate needs all three rounds; entropy is optional and ignored. A signing key is required
   /// only in R3; it is optional and ignored in R1, R2, and Aggregate.
@@ -537,6 +540,7 @@ impl WRAPS {
         round3_messages.len(),
       ],
     )?;
+    let message = decode_rotation_message(message_to_sign.as_ref())?;
 
     // Unused round lists are empty after phase validation, so they decode to empty vectors.
     let round1 = decode_round_messages(round1_messages, "round-1", |message| match message {
@@ -555,28 +559,26 @@ impl WRAPS {
     match phase {
       SigningProtocolPhase::R1 => {
         let seed = protocol_instance_entropy.expect("validated R1 entropy");
-        encode_protocol_message(RoundMessage::Round1(Multisig::<E2>::round1(seed)))
+        encode_protocol_message(RoundMessage::Round1(Multisig::<E2>::round1(seed, &message)))
       }
       SigningProtocolPhase::R2 => {
         let seed = protocol_instance_entropy.expect("validated R2 entropy");
-        if !round1.contains(&Multisig::<E2>::round1(seed)) {
+        if !round1.contains(&Multisig::<E2>::round1(seed, &message)) {
           return Err(WrapsError::invalid_input(
             "R2 is missing the caller's round-1 commitment",
           ));
         }
-        encode_protocol_message(RoundMessage::Round2(Multisig::<E2>::round2(seed)))
+        encode_protocol_message(RoundMessage::Round2(Multisig::<E2>::round2(seed, &message)))
       }
       SigningProtocolPhase::R3 => {
         let seed = protocol_instance_entropy.expect("validated R3 entropy");
         let sk = signing_key.expect("validated R3 signing key");
-        let message = decode_rotation_message(message_to_sign.as_ref())?;
         let pc = shared_constants();
         let share =
           Multisig::<E2>::round3(&pc, seed, &message, sk, &participants, &round1, &round2)?;
         encode_protocol_message(RoundMessage::Round3(share))
       }
       SigningProtocolPhase::Aggregate => {
-        let message = decode_rotation_message(message_to_sign.as_ref())?;
         let pc = shared_constants();
         let signature =
           Multisig::<E2>::aggregate(&pc, &message, &participants, &round1, &round2, &round3)?;
@@ -681,23 +683,13 @@ impl WRAPS {
   ///
   /// Uses Nova's setup with the constants and commitment keys already in `pp`.
   /// Setup initializes the verifier-key digest caches. The returned key owns its
-  /// verification material; reuse it across proofs.
+  /// verification material; reuse it across proofs or serialize it with [`encode`].
   pub fn setup_compressed_verifier(
     pp: &PublicParams,
   ) -> Result<CompressedVerifyingKey, WrapsError> {
     let (_, inner) = CompressedSNARK::<_, _, _, S1, S2>::setup(pp)
       .map_err(|e| WrapsError::cryptography(format!("compressed verifier setup failed: {e}")))?;
     Ok(CompressedVerifyingKey { inner })
-  }
-
-  /// Exports the compact verification-key descriptor.
-  ///
-  /// This 778-byte, versioned descriptor includes application-specific values,
-  /// the ceremony-dependent PCS key, and small fixed secondary-key fields.
-  /// Poseidon constants and IPA generator arrays are omitted. This is an export
-  /// format; [`Self::setup_compressed_verifier`] takes public parameters directly.
-  pub fn get_compressed_verification_key(pp: &PublicParams) -> Result<Vec<u8>, WrapsError> {
-    verification_key::export(pp)
   }
 
   /// Folds one rotation into the chain and compresses the result.
@@ -873,12 +865,13 @@ impl WRAPS {
     ledger_id: impl AsRef<[u8]>,
     hints_vk: impl AsRef<[u8]>,
   ) -> Result<bool, WrapsError> {
-    let [ab_genesis_hash, _] = decode_rotation_message(ledger_id.as_ref())?;
+    let [ab_genesis_hash, genesis_hints_vk_hash] = decode_rotation_message(ledger_id.as_ref())?;
     let running = decode::<UncompressedWrapsProof>(running_proof)?;
 
     if running.z0.len() != 2
       || running.zi.len() != 2
       || running.z0[0] != ab_genesis_hash
+      || running.z0[1] != genesis_hints_vk_hash
       || running.zi[1] != Self::compute_hints_vk_hash(hints_vk)
     {
       return Ok(false);
@@ -892,8 +885,9 @@ impl WRAPS {
 
   /// Checks a compressed proof against a prepared verifier key.
   ///
-  /// Only the proof and ledger ID are decoded. Constants, generators, and the verifier-key
-  /// digests computed during setup are reused across calls.
+  /// Only the proof and ledger ID are decoded. Constants, generators, and cached
+  /// verifier-key digests are reused across calls. A deserialized key initializes
+  /// its digest caches on the first verification.
   ///
   /// Beyond the SNARK itself this pins the two ends of the chain: it must start at
   /// the address-book hash in `ledger_id` and must currently carry `hints_vk`.
@@ -905,14 +899,14 @@ impl WRAPS {
     ledger_id: impl AsRef<[u8]>,
     hints_vk: impl AsRef<[u8]>,
   ) -> Result<bool, WrapsError> {
-    let [ab_genesis_hash, _] = decode_rotation_message(ledger_id.as_ref())?;
+    let [ab_genesis_hash, genesis_hints_vk_hash] = decode_rotation_message(ledger_id.as_ref())?;
     let proof = decode::<CompressedWrapsProof>(proof_serialized)?;
 
     if proof.z0.len() != 2 || proof.zi.len() != 2 {
       return Ok(false);
     }
     // The chain starts at the genesis book, and currently carries the expected hints key.
-    let genesis_ok = proof.z0[0] == ab_genesis_hash;
+    let genesis_ok = proof.z0[0] == ab_genesis_hash && proof.z0[1] == genesis_hints_vk_hash;
     let hints_ok = proof.zi[1] == Self::compute_hints_vk_hash(hints_vk);
 
     // Nova returns the final state authenticated by the SNARK. It must agree with

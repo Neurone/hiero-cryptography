@@ -306,7 +306,7 @@ impl HinTS {
         for j in 0..n {
             let num: DensePolynomial<F>; // = compute_constant_poly(&F::from(0));
             if i == j {
-                num = l_i_of_x.mul(&l_i_of_x).sub(&l_i_of_x);
+                num = (&l_i_of_x * &l_i_of_x).sub(&l_i_of_x);
             } else {
                 //cross-terms
                 let l_j_of_x = utils::lagrange_poly(n, j).ok_or(
@@ -329,11 +329,11 @@ impl HinTS {
         let l_i_of_0_poly = utils::compute_constant_poly(&l_i_of_0);
 
         //numerator is l_i(x) - l_i(0)
-        let num = l_i_of_x.sub(&l_i_of_0_poly);
+        let num = &l_i_of_x - &l_i_of_0_poly;
         //denominator is x
         let den = utils::compute_x_monomial();
         //qx_term = sk_i * (l_i(x) - l_i(0)) / x
-        let qx_term = utils::poly_eval_mult_c(&num.div(&den), sk);
+        let qx_term = utils::poly_eval_mult_c(&(&num / &den), sk);
         //qx_term_mul_tau = sk_i * (l_i(x) - l_i(0)) / x
         let qx_term_mul_tau = utils::poly_eval_mult_c(&num, sk);
         //qx_term_com = [ sk_i * (l_i(τ) - l_i(0)) / τ ]_1
@@ -454,7 +454,7 @@ impl HinTS {
         let den = utils::compute_x_monomial();
 
         //qx_term = (l_i(x) - l_i(0)) / x
-        let qx_term = &num.div(&den);
+        let qx_term = &(&num / &den);
         //qx_term_com = [ sk_i * (l_i(τ) - l_i(0)) / τ ]_1
         let qx_term_com = KZG::commit_g2(&crs, &qx_term)?;
         let lhs = <Curve as Pairing>::pairing(hint.qx_i_term, crs.powers_of_h[0]);
@@ -631,6 +631,11 @@ impl HinTS {
             );
         }
 
+        // an identity key or signature satisfies the pairing equation trivially, and preprocess
+        // gives every slot without a registered hint the identity key
+        check_or_return_false!(!ak.pks[party_id].is_zero());
+        check_or_return_false!(!sig.is_zero());
+
         let lhs = <Curve as Pairing>::pairing(ak.pks[party_id], hash_to_g2(msg)?);
         let rhs = <Curve as Pairing>::pairing(G1AffinePoint::generator(), sig);
         Ok(lhs == rhs)
@@ -662,7 +667,7 @@ impl HinTS {
             ));
         }
 
-        // an empty batch verifies vacuously: add() returns the identity in both groups, so the
+        // an empty batch verifies vacuously: msm returns the identity in both groups, so the
         // pairing check below collapses to 1_GT == 1_GT and we would report success without
         // having verified anything. Wrong direction to fail in.
         if signer_ids.as_ref().is_empty() {
@@ -678,10 +683,29 @@ impl HinTS {
             ));
         }
 
-        // compute aggregate public key of all signers
-        let apk = add::<G1AffinePoint>(signer_ids.as_ref().iter().map(|&x| ak.pks[x]));
-        // compute aggregate signature
-        let agg_sig = add::<G2AffinePoint>(signatures.as_ref().iter().map(|sig| sig.clone()));
+        // as in partial_verify, but per signer: an identity pair leaves both sums below
+        // unchanged, so checking only the sums would let it pass alongside honest signers
+        check_or_return_false!(signer_ids.as_ref().iter().all(|&id| !ak.pks[id].is_zero()));
+        check_or_return_false!(signatures.as_ref().iter().all(|sig| !sig.is_zero()));
+
+        // Comparing only the plain sums would accept invalid signatures whose errors cancel:
+        // for any point D, σ_a + D and σ_b - D have the same sum as σ_a and σ_b. So we weight
+        // entry i by r^i, for an r drawn at random after the batch is fixed. If any entry is
+        // invalid, the weighted check passes only if r is a root of a nonzero polynomial of
+        // degree below the batch size k, which happens with probability below k/|F|.
+        let r = F::rand(&mut rand::rngs::OsRng);
+        // the weights 1, r, r^2, ..., r^(k-1): successors yields its first argument, then keeps
+        // applying the closure to the last value, so each weight is the previous one times r;
+        // the closure never returns None, so take(k) is what ends the sequence
+        let coefficients: Vec<F> = std::iter::successors(Some(F::from(1)), |c| Some(*c * r))
+            .take(signatures.as_ref().len())
+            .collect();
+
+        // compute weighted aggregate public key of all signers
+        let pks: Vec<PublicKey> = signer_ids.as_ref().iter().map(|&x| ak.pks[x]).collect();
+        let apk = G1ProjectivePoint::msm_unchecked(&pks, &coefficients);
+        // compute weighted aggregate signature
+        let agg_sig = G2ProjectivePoint::msm_unchecked(signatures.as_ref(), &coefficients);
 
         let lhs = <Curve as Pairing>::pairing(apk, hash_to_g2(msg)?);
         let rhs = <Curve as Pairing>::pairing(G1AffinePoint::generator(), agg_sig);
@@ -936,11 +960,7 @@ fn prove(
     let p_mrg_of_x = merge_polys(&[&p1_of_x, &p2_of_x, &p3_of_x, &p4_of_x], &χ_q);
 
     // Z(X) = X^n - 1 is sparse, so this division takes linear time
-    let (q_mrg_of_x, remainder) = p_mrg_of_x.divide_by_vanishing_poly(domain).ok_or(
-        HinTSError::CryptographyCatastrophe(
-            format!("Unable to divide by the vanishing polynomial for n = {}", n)
-        )
-    )?;
+    let (q_mrg_of_x, remainder) = p_mrg_of_x.divide_by_vanishing_poly(domain);
     let exact = remainder.coeffs.iter().all(|c| *c == F::from(0));
     let q_mrg_of_tau_com = KZG::commit_g1(crs, &q_mrg_of_x)?;
 
@@ -1393,7 +1413,7 @@ fn proof_of_knowledge_random_oracle(
         .map_err(|e| HinTSError::EncodingError(e))?;
 
     let hasher = <DefaultFieldHasher<Sha256> as HashToField<F>>::new(POP_DST);
-    Ok(hasher.hash_to_field(&serialized_data, 1)[0])
+    Ok(hasher.hash_to_field::<1>(&serialized_data)[0])
 }
 
 /// the KZG check that π opens C to y at α: e(C − y·[1]_1, [1]_2) = e(π, [τ − α]_2).
@@ -1766,6 +1786,62 @@ mod tests {
         let no_ids: [usize; 0] = [];
         let no_sigs: [PartialSignature; 0] = [];
         assert!(HinTS::partial_verify_batch(msg, &ak, no_ids, no_sigs).is_err());
+    }
+
+    /// partial_verify rejects signatures that don't verify under the party's key. A slot with
+    /// no registered hint holds the identity key, which the identity signature used to satisfy
+    /// trivially (both pairings are 1 in GT); the batch must reject that pair too, though it
+    /// leaves the batch's sums unchanged.
+    #[test]
+    fn test_partial_verify_rejects_invalid_signatures() {
+        let n = 8;
+        let msg = b"partial";
+        let (crs, _ak, _vk, sks, epks) = sample_universe(n);
+
+        // only parties 0 to 3 register, so slots 4 to 6 hold the identity key
+        let weights = sample_weights(n);
+        let signer_info: HashMap<usize, (Weight, ExtendedPublicKey)> =
+            (0..4).map(|i| (i, (weights[i], epks[i].clone()))).collect();
+        let (_vk, ak) = HinTS::preprocess(n, &crs, &signer_info).unwrap();
+        let absent = 4;
+        assert!(ak.pks[absent].is_zero());
+
+        let sig = HinTS::sign(msg, &sks[0]).unwrap();
+        let identity = G2AffinePoint::zero();
+
+        // sanity: the honest signature verifies, singly and in a batch
+        assert!(HinTS::partial_verify(msg, &ak, 0, &sig).unwrap());
+        assert!(HinTS::partial_verify_batch(msg, &ak, [0usize], [sig]).unwrap());
+
+        // a signature on another message, and one under another key
+        let wrong_msg = HinTS::sign(b"other", &sks[0]).unwrap();
+        assert!(!HinTS::partial_verify(msg, &ak, 0, &wrong_msg).unwrap());
+        let wrong_key = HinTS::sign(msg, &HinTS::keygen([7u8; 32]).unwrap()).unwrap();
+        assert!(!HinTS::partial_verify(msg, &ak, 0, &wrong_key).unwrap());
+
+        // the identity signature, on a registered slot and on the absent one
+        assert!(!HinTS::partial_verify(msg, &ak, 0, &identity).unwrap());
+        assert!(!HinTS::partial_verify(msg, &ak, absent, &identity).unwrap());
+        assert!(!HinTS::partial_verify_batch(msg, &ak, [0, absent], [sig, identity]).unwrap());
+    }
+
+    /// The batch used to check only the plain sums, so entries whose errors cancel passed:
+    /// σ_a + D and σ_b - D from two signers, or from one signer listed twice.
+    #[test]
+    fn test_partial_verify_batch_rejects_offsetting_signatures() {
+        let msg = b"offset";
+        let (_crs, ak, _vk, sks, _epks) = sample_universe(8);
+        let sig_a = HinTS::sign(msg, &sks[1]).unwrap();
+        let sig_b = HinTS::sign(msg, &sks[4]).unwrap();
+        let d = G2AffinePoint::generator();
+
+        // sanity: the honest batch verifies
+        assert!(HinTS::partial_verify_batch(msg, &ak, [1usize, 4], [sig_a, sig_b]).unwrap());
+
+        let (a_plus, a_minus, b_minus) =
+            ((sig_a + d).into_affine(), (sig_a - d).into_affine(), (sig_b - d).into_affine());
+        assert!(!HinTS::partial_verify_batch(msg, &ak, [1usize, 4], [a_plus, b_minus]).unwrap());
+        assert!(!HinTS::partial_verify_batch(msg, &ak, [1usize, 1], [a_plus, a_minus]).unwrap());
     }
 
     /// A key whose n disagrees with its vectors must be rejected by every consumer, rather

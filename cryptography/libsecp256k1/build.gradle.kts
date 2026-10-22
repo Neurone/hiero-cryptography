@@ -20,8 +20,8 @@ tasks.test {
 
 jmhModuleInfo {
     requires("com.hedera.cryptography.libsecp256k1")
-    requires("org.hyperledger.besu.nativelib.secp256k1")
     requires("com.sun.jna")
+    requires("org.hyperledger.besu.nativelib.secp256k1")
 }
 
 /// Where we check out the native library repo from GitHub into the local build/ directory:
@@ -34,8 +34,8 @@ val libOutputDir = layout.buildDirectory.dir("libsecp256k1/output")
 tasks.register<GitClone>("cloneSecp256k1") {
     localCloneDirectory = libRepositoryDir
     url = "https://github.com/bitcoin-core/secp256k1.git"
-    // branch = "master"
-    tag = "v0.7.1"
+    // The commit hash for tag v0.7.1 as of 2026-10-14:
+    tag = "1a53f4961f337b4d166c25fce72ef0dc88806618"
 }
 
 // We cannot build from a single repo for multiple targets at once. So we limit parallelizm:
@@ -57,10 +57,6 @@ abstract class BuildSecp256k1Task : DefaultTask() {
 
     /// ./configure --host ... string, or a blank string to omit the --host arg.
     @get:Input abstract val configureHost: Property<String>
-
-    /// To make Gradle Cache happy, we're adding yet another input property that contains "os-arch".
-    /// Apparently, the `outputPath` below is insufficient for Gradle Cache to key an entry.
-    @get:Input abstract val targetId: Property<String>
 
     /// Where the binary library to be written.
     /// Likely build/third-party/<name>/output/<os>-<arch>.
@@ -213,7 +209,6 @@ targets.forEach { target ->
         tasks.register<BuildSecp256k1Task>(name) {
             libraryDir = tasks.named<GitClone>("cloneSecp256k1").flatMap { it.localCloneDirectory }
             configureHost = target.configureHost
-            targetId = "${target.os}-${target.arch}"
             outputDir = libOutputDir.get().dir("${target.os}-${target.arch}")
             outputPath = "com/hedera/nativelib/libsecp256k1/${target.os}/${target.arch}"
         }

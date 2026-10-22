@@ -192,8 +192,8 @@ impl SigningFixture {
     let bits = BitVector::from(core::array::from_fn(|i| i == 0 || i == 2));
     let seeds = [[21; ENTROPY_SIZE], [22; ENTROPY_SIZE]];
     let participants = [members[0].1 .0, members[2].1 .0];
-    let round1 = seeds.map(Multisig::<E2>::round1);
-    let round2 = seeds.map(Multisig::<E2>::round2);
+    let round1 = seeds.map(|seed| Multisig::<E2>::round1(seed, &typed_message));
+    let round2 = seeds.map(|seed| Multisig::<E2>::round2(seed, &typed_message));
     let round3 = [0usize, 2]
       .into_iter()
       .enumerate()
@@ -1027,10 +1027,43 @@ fn nonce_commitments_are_deterministic_and_distinguish_nonces() {
 
   // Round 1 is the commitment, so it inherits all of that.
   let seed = [5u8; ENTROPY_SIZE];
+  let msg = arbitrary_message();
   assert_eq!(
-    Multisig::<E2>::round1(seed),
-    Multisig::<E2>::commit_nonce(&(<E2 as Engine>::GE::gen() * Multisig::<E2>::nonce(seed)))
+    Multisig::<E2>::round1(seed, &msg),
+    Multisig::<E2>::commit_nonce(&(<E2 as Engine>::GE::gen() * Multisig::<E2>::nonce(seed, &msg)))
   );
+}
+
+#[test]
+fn multisig_nonce_binds_entropy_and_both_message_components() {
+  use rand_core::SeedableRng;
+
+  let seed = [5u8; ENTROPY_SIZE];
+  let msg = arbitrary_message();
+  // Independently computed SHA-256 vector for 32 bytes of 0x05, followed by the
+  // canonical 32-byte little-endian field encodings of 7 and 11, with no framing.
+  let expected_seed = [
+    236, 1, 131, 110, 15, 47, 73, 155, 140, 109, 194, 73, 238, 162, 180, 182, 123, 87, 153, 21, 91,
+    10, 132, 205, 167, 160, 110, 64, 219, 160, 94, 86,
+  ];
+  let expected_nonce =
+    SchnorrNonce::<E2>::random(&mut rand_chacha::ChaCha20Rng::from_seed(expected_seed));
+  let nonce = Multisig::<E2>::nonce(seed, &msg);
+  let round1 = Multisig::<E2>::round1(seed, &msg);
+  assert_eq!(nonce, expected_nonce);
+  assert_eq!(nonce, Multisig::<E2>::nonce(seed, &msg));
+  assert_eq!(round1, Multisig::<E2>::round1(seed, &msg));
+
+  let mut different_seed = seed;
+  different_seed[0] ^= 1;
+  assert_ne!(nonce, Multisig::<E2>::nonce(different_seed, &msg));
+  assert_ne!(round1, Multisig::<E2>::round1(different_seed, &msg));
+  for component in 0..msg.len() {
+    let mut different_msg = msg;
+    different_msg[component] += Base::ONE;
+    assert_ne!(nonce, Multisig::<E2>::nonce(seed, &different_msg));
+    assert_ne!(round1, Multisig::<E2>::round1(seed, &different_msg));
+  }
 }
 
 #[test]
@@ -1048,11 +1081,11 @@ fn signing_protocol_rejects_a_nonce_that_does_not_open_its_commitment() {
     .collect::<Vec<_>>();
   let round1 = seeds
     .iter()
-    .map(|s| Multisig::<E2>::round1(*s))
+    .map(|s| Multisig::<E2>::round1(*s, &msg))
     .collect::<Vec<_>>();
   let mut round2 = seeds
     .iter()
-    .map(|s| Multisig::<E2>::round2(*s))
+    .map(|s| Multisig::<E2>::round2(*s, &msg))
     .collect::<Vec<_>>();
 
   // A signer who tries to choose its nonce after seeing the others is caught in round
@@ -1099,14 +1132,14 @@ fn one_seed_per_instance_spans_all_three_rounds() {
     .collect::<Vec<_>>();
   let round1 = seeds
     .iter()
-    .map(|s| Multisig::<E2>::round1(*s))
+    .map(|s| Multisig::<E2>::round1(*s, &msg))
     .collect::<Vec<_>>();
 
   // Carrying the seed forward is what makes round 2 open round 1: the rounds hold no
   // state, so the nonce has to come back out of the same entropy.
   let round2 = seeds
     .iter()
-    .map(|s| Multisig::<E2>::round2(*s))
+    .map(|s| Multisig::<E2>::round2(*s, &msg))
     .collect::<Vec<_>>();
   assert!(Multisig::<E2>::round3(
     &pc,
@@ -1122,7 +1155,7 @@ fn one_seed_per_instance_spans_all_three_rounds() {
   // Switching seeds mid-instance breaks it, and is caught as a failed opening rather
   // than silently producing an unverifiable signature.
   let mut divergent = round2.clone();
-  divergent[0] = Multisig::<E2>::round2(rand::thread_rng().gen());
+  divergent[0] = Multisig::<E2>::round2(rand::thread_rng().gen(), &msg);
   let err = Multisig::<E2>::round3(
     &pc,
     seeds[0],
@@ -1138,13 +1171,49 @@ fn one_seed_per_instance_spans_all_three_rounds() {
     "expected signer 0's opening to fail, got: {err}"
   );
 
-  // Across instances the seed must change, and nothing in the API can enforce that —
-  // reusing one silently repeats the nonce, which is what the contract forbids.
-  let other_instance = Multisig::<E2>::round1(seeds[0]);
+  // Reusing both the seed and message repeats the nonce, so callers must still use
+  // fresh entropy for each instance even though distinct messages now separate nonces.
+  let other_instance = Multisig::<E2>::round1(seeds[0], &msg);
   assert_eq!(
     other_instance, round1[0],
-    "a repeated seed repeats the nonce commitment; the caller owns this"
+    "repeated entropy and message repeat the nonce commitment"
   );
+}
+
+#[test]
+fn signing_protocol_rejects_message_changes_between_rounds() {
+  use SigningProtocolPhase::{R2, R3};
+  let f = SigningFixture::new();
+  let message = decode::<RotationMessage<E2>>(&f.message).unwrap();
+
+  for component in 0..message.len() {
+    let mut changed = message;
+    changed[component] += Base::ONE;
+    let changed = encode(&changed).unwrap();
+    for phase in [R2, R3] {
+      assert!(
+        WRAPS::signing_protocol(
+          phase,
+          Some(f.seeds[0]),
+          &changed,
+          (phase == R3).then_some(&f.keys[0]),
+          &f.book,
+          f.bits,
+          &f.rounds[0],
+          if phase == R3 { &f.rounds[1] } else { &[] },
+          &[],
+        )
+        .is_err(),
+        "{phase:?} accepted a change to message component {component}"
+      );
+    }
+
+    // A new transcript over the changed message still completes through the public
+    // API and verifies, so rejection above comes from mixing protocol instances.
+    let signature = threshold_sign(&changed, &f.book, &f.keys, &f.bits);
+    assert!(WRAPS::verify_signature(&f.book, &changed, &signature).unwrap());
+    assert!(!WRAPS::verify_signature(&f.book, &f.message, &signature).unwrap());
+  }
 }
 
 #[test]
@@ -1155,13 +1224,24 @@ fn signing_protocol_enforces_its_round_order() {
   let key = Some(&f.keys[0]);
   let phases = [R1, R2, R3, Aggregate];
 
-  // A signer can commit before receiving the book or rotation message.
+  // A signer can commit before receiving the signing book, but needs the message.
   assert_eq!(
-    WRAPS::signing_protocol(R1, seed, [], None, &vec![], [], &[], &[], &[]).unwrap(),
+    WRAPS::signing_protocol(R1, seed, &f.message, None, &vec![], [], &[], &[], &[]).unwrap(),
     SigningProtocolObject::ProtocolMessage(f.rounds[0][0].clone())
   );
   assert_eq!(
-    WRAPS::signing_protocol(R2, seed, [], None, &f.book, f.bits, &f.rounds[0], &[], &[]).unwrap(),
+    WRAPS::signing_protocol(
+      R2,
+      seed,
+      &f.message,
+      None,
+      &f.book,
+      f.bits,
+      &f.rounds[0],
+      &[],
+      &[]
+    )
+    .unwrap(),
     SigningProtocolObject::ProtocolMessage(f.rounds[1][0].clone())
   );
   assert_eq!(
@@ -1238,7 +1318,7 @@ fn signing_protocol_enforces_its_round_order() {
 
 #[test]
 fn signing_protocol_rejects_malformed_or_wrong_round_bytes() {
-  use SigningProtocolPhase::{Aggregate, R2, R3};
+  use SigningProtocolPhase::{Aggregate, R1, R2, R3};
   let f = SigningFixture::new();
 
   for (round, phase) in [R2, R3, Aggregate].into_iter().enumerate() {
@@ -1284,22 +1364,20 @@ fn signing_protocol_rejects_malformed_or_wrong_round_bytes() {
     trailing,
     vec![255; 64],
   ] {
-    for phase in [R3, Aggregate] {
+    for (index, phase) in [R1, R2, R3, Aggregate].into_iter().enumerate() {
+      let histories: [&[SigningProtocolMessage]; 3] =
+        core::array::from_fn(|round| if round < index { &f.rounds[round][..] } else { &[] });
       assert!(matches!(
         WRAPS::signing_protocol(
           phase,
-          (phase == R3).then_some(f.seeds[0]),
+          (phase != Aggregate).then_some(f.seeds[0]),
           &malformed,
           (phase == R3).then_some(&f.keys[0]),
           &f.book,
           f.bits,
-          &f.rounds[0],
-          &f.rounds[1],
-          if phase == Aggregate {
-            &f.rounds[2]
-          } else {
-            &[]
-          },
+          histories[0],
+          histories[1],
+          histories[2],
         ),
         Err(WrapsError::InvalidInput(_))
       ));
@@ -1402,19 +1480,32 @@ fn signing_protocol_validates_the_selected_book() {
   let seed = Some(f.seeds[0]);
   let mut outside = f.bits;
   outside[f.book.len()] = true;
-  assert!(WRAPS::signing_protocol(R1, seed, [], None, &f.book, outside, &[], &[], &[],).is_err());
+  assert!(
+    WRAPS::signing_protocol(R1, seed, &f.message, None, &f.book, outside, &[], &[], &[],).is_err()
+  );
   for bits in [outside, BitVector::from([false; MAX_AB_SIZE])] {
-    assert!(
-      WRAPS::signing_protocol(R2, seed, [], None, &f.book, bits, &f.rounds[0], &[], &[],).is_err()
-    );
+    assert!(WRAPS::signing_protocol(
+      R2,
+      seed,
+      &f.message,
+      None,
+      &f.book,
+      bits,
+      &f.rounds[0],
+      &[],
+      &[],
+    )
+    .is_err());
   }
   signature.0 = outside;
   assert!(!WRAPS::verify_signature(&f.book, &f.message, &signature).unwrap());
-  assert!(WRAPS::signing_protocol(R2, seed, [], None, &vec![], [], &[], &[], &[],).is_err());
+  assert!(
+    WRAPS::signing_protocol(R2, seed, &f.message, None, &vec![], [], &[], &[], &[],).is_err()
+  );
   assert!(WRAPS::signing_protocol(
     R1,
     seed,
-    [],
+    &f.message,
     None,
     &f.book,
     [false; MAX_AB_SIZE + 1],
@@ -1424,14 +1515,16 @@ fn signing_protocol_validates_the_selected_book() {
   )
   .is_err());
   let oversized = vec![f.book[0].clone(); MAX_AB_SIZE + 1];
-  assert!(WRAPS::signing_protocol(R1, seed, [], None, &oversized, [], &[], &[], &[],).is_err());
+  assert!(
+    WRAPS::signing_protocol(R1, seed, &f.message, None, &oversized, [], &[], &[], &[],).is_err()
+  );
   let mut invalid_book = f.book.clone();
   invalid_book[0].1 .1.response += SchnorrResponse::<E2>::ONE;
   for phase in [R1, R2] {
     assert!(WRAPS::signing_protocol(
       phase,
       seed,
-      [],
+      &f.message,
       None,
       &invalid_book,
       f.bits,
@@ -1598,8 +1691,8 @@ fn cancelling_attested_keys_are_rejected_natively_and_in_circuit() {
   let message = WRAPS::compute_rotation_message(&book, b"cancelled keys").unwrap();
   let typed = decode::<RotationMessage<E2>>(&message).unwrap();
   let seeds = [[41; ENTROPY_SIZE], [42; ENTROPY_SIZE]];
-  let round1 = seeds.map(Multisig::<E2>::round1);
-  let round2 = seeds.map(Multisig::<E2>::round2);
+  let round1 = seeds.map(|seed| Multisig::<E2>::round1(seed, &typed));
+  let round2 = seeds.map(|seed| Multisig::<E2>::round2(seed, &typed));
   assert!(
     Multisig::<E2>::round3(&pc, seeds[0], &typed, &sk, &participants, &round1, &round2).is_err()
   );
@@ -1927,21 +2020,19 @@ fn verification_keys_are_deterministic_across_processes() {
 
   const CHILD_OUTPUT: &str = "WRAPS_KEY_TEST_CHILD_OUTPUT";
   const TEST_NAME: &str = "tests::verification_keys_are_deterministic_across_processes";
-  const ARTIFACTS: [&str; 3] = ["compact-vk.bin", "full-vk.bin", "pp-digest.bin"];
+  const ARTIFACTS: [&str; 2] = ["verifier-key.bin", "pp-digest.bin"];
 
   // Each child runs only this test with fresh process globals and OS randomness.
-  // It derives both keys from independently loaded parameters, then exits.
+  // It derives the key from independently loaded parameters, then exits.
   if let Some(output) = std::env::var_os(CHILD_OUTPUT) {
     let output = std::path::PathBuf::from(output);
     let pp = WRAPS::load_public_params(&ptau_dir()).expect("child public parameters");
     let vk = WRAPS::setup_compressed_verifier(&pp).expect("child verifier setup");
-    let compact = WRAPS::get_compressed_verification_key(&pp).expect("child compact export");
-    let full = encode(&vk.inner).expect("serialize full Nova verifier key");
-    assert_eq!(compact.len(), 778);
-    assert_eq!(full.len(), 4_738_776);
-    fs::write(output.join(ARTIFACTS[0]), compact).unwrap();
-    fs::write(output.join(ARTIFACTS[1]), full).unwrap();
-    fs::write(output.join(ARTIFACTS[2]), encode(&pp.digest()).unwrap()).unwrap();
+    let prepared = encode(&vk).expect("serialize prepared verifier key");
+    assert_eq!(prepared.len(), 4_738_776);
+    assert_eq!(prepared, encode(&vk.inner).unwrap());
+    fs::write(output.join(ARTIFACTS[0]), prepared).unwrap();
+    fs::write(output.join(ARTIFACTS[1]), encode(&pp.digest()).unwrap()).unwrap();
     return;
   }
 
@@ -2017,42 +2108,18 @@ fn prepared_key_matches_the_stock_mercury_key() {
 /// changes to the circuit or proving system.
 #[test]
 fn artifact_sizes() {
-  use crate::verification_key::{
-    Descriptor, ARITY, MAGIC, PRIMARY_DIMENSION, PRIMARY_DOMAIN, SECONDARY_DIMENSION,
-    SECONDARY_GENERATORS, VERSION, WIRE_BYTES,
-  };
-
   let (wraps_pp, wraps_vk) = wraps_setup();
 
   // Public parameters and the verification key are separate artifacts.
   let pp_bytes = encode(wraps_pp).unwrap().len();
-  let verification_key_bytes = encode(&wraps_vk.inner).unwrap().len();
 
-  // Check the actual exported descriptor without a separate setup or fixture.
-  let compact_key = WRAPS::get_compressed_verification_key(wraps_pp).unwrap();
-  let verifier_key_payload_bytes = compact_key.len();
-  assert_eq!(verifier_key_payload_bytes, WIRE_BYTES);
-  assert_eq!(&compact_key[..8], &MAGIC);
-  assert_eq!(&compact_key[8..10], &VERSION.to_le_bytes());
-  let descriptor: Descriptor = decode(&compact_key).unwrap();
-  assert_eq!(encode(&descriptor).unwrap(), compact_key);
-  assert_eq!(descriptor.magic, MAGIC);
-  assert_eq!(descriptor.version, VERSION);
-  assert_eq!(descriptor.arity, ARITY);
-  assert_eq!(descriptor.pp_digest, wraps_pp.digest());
-  assert_eq!(descriptor.primary.num_cons, PRIMARY_DIMENSION);
-  assert_eq!(descriptor.primary.num_vars, PRIMARY_DIMENSION);
-  assert_eq!(descriptor.primary.shape_commitment.N, PRIMARY_DOMAIN);
-  assert_eq!(descriptor.secondary.num_cons, SECONDARY_DIMENSION);
-  assert_eq!(descriptor.secondary.num_vars, SECONDARY_DIMENSION);
-  assert_eq!(
-    descriptor.secondary.shape_commitment.N,
-    SECONDARY_GENERATORS
-  );
-  assert_eq!(
-    descriptor.secondary.generator_count,
-    SECONDARY_GENERATORS as u64,
-  );
+  // Callers serialize the complete prepared verifier with the native Nova encoding.
+  let serialized_key = encode(wraps_vk).unwrap();
+  let verification_key_bytes = serialized_key.len();
+  println!("compressed verification key: {verification_key_bytes} bytes");
+  assert_eq!(serialized_key, encode(&wraps_vk.inner).unwrap());
+  let restored_key: CompressedVerifyingKey = decode(&serialized_key).unwrap();
+  assert_eq!(encode(&restored_key).unwrap(), serialized_key);
 
   // One genesis rotation, to get a proof of each kind.
   let (genesis_ab, genesis_keys) = random_address_book();
@@ -2079,6 +2146,9 @@ fn artifact_sizes() {
   // Succinct proofs use the ordinary bincode encoding, without zlib.
   let proof = decode::<CompressedWrapsProof>(&compressed).unwrap();
   assert_eq!(encode(&proof).unwrap(), compressed);
+  assert!(
+    WRAPS::verify_compressed_wraps_proof(&restored_key, &compressed, &message, hints_vk).unwrap()
+  );
 
   // The shape these numbers have to keep. Compression is the point of the whole
   // exercise: the artifact a verifier receives is two orders of magnitude smaller
@@ -2087,14 +2157,9 @@ fn artifact_sizes() {
     compressed.len() < running.len() / 100,
     "compression should buy two orders of magnitude"
   );
-  assert_eq!(
-    verifier_key_payload_bytes, 778,
-    "the compact verification-key payload must stay within its fixed wire format"
-  );
-
   assert!(
     verification_key_bytes > 4_000_000,
-    "expanded key includes IPA bases"
+    "the complete verification key includes IPA bases"
   );
 
   // Absolute guards, generously sized.
@@ -2113,8 +2178,8 @@ fn artifact_sizes() {
     running.len()
   );
   assert!(
-    verifier_key_payload_bytes < 1024,
-    "compact verification key: {verifier_key_payload_bytes} bytes"
+    verification_key_bytes < 8 * 1024 * 1024,
+    "compressed verification key: {verification_key_bytes} bytes"
   );
 }
 
@@ -2206,15 +2271,15 @@ fn wraps_simulation() {
         );
       }
 
-      // Verification uses only the ledger's address-book hash; current hints are separate.
+      // Verification also binds the ledger's genesis hints hash, not just its address-book hash.
       let mut other_genesis_hints: RotationMessage<E2> = decode(&ledger_id).unwrap();
       other_genesis_hints[1] += Base::ONE;
       let other_ledger_id = encode(&other_genesis_hints).unwrap();
-      assert!(WRAPS::verify_compressed_wraps_proof(
+      assert!(!WRAPS::verify_compressed_wraps_proof(
         wraps_vk, &compressed, &other_ledger_id, hints_vk,
       )
       .unwrap());
-      assert!(WRAPS::verify_uncompressed_wraps_proof(
+      assert!(!WRAPS::verify_uncompressed_wraps_proof(
         wraps_pp, &uncompressed, &other_ledger_id, hints_vk,
       )
       .unwrap());

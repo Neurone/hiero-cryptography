@@ -20,8 +20,8 @@ tasks.test {
 
 jmhModuleInfo {
     requires("com.hedera.cryptography.libsodium")
-    requires("com.goterl.lazysodium")
     requires("com.hedera.pbj.runtime")
+    requires("com.goterl.lazysodium")
 }
 
 /// Where we check out the libsodium repo from GitHub into the local build/ directory:
@@ -34,8 +34,8 @@ val libOutputDir = layout.buildDirectory.dir("libsodium/output")
 tasks.register<GitClone>("cloneLibsodium") {
     localCloneDirectory = libRepositoryDir
     url = "https://github.com/jedisct1/libsodium.git"
-    // branch = "master"
-    tag = "1.0.22-RELEASE"
+    // The commit hash for tag 1.0.22-RELEASE as of 2026-10-14:
+    tag = "77e1ce5d6dee871c49ef211222ba18ef0c486bda"
 }
 
 // We cannot build from a single repo for multiple targets at once. So we limit parallelizm:
@@ -57,10 +57,6 @@ abstract class BuildLibsodiumTask : DefaultTask() {
 
     /// ./configure --host ... string, or a blank string to omit the --host arg.
     @get:Input abstract val configureHost: Property<String>
-
-    /// To make Gradle Cache happy, we're adding yet another input property that contains "os-arch".
-    /// Apparently, the `outputPath` below is insufficient for Gradle Cache to key an entry.
-    @get:Input abstract val targetId: Property<String>
 
     /// Where the binary library to be written.
     /// Likely build/third-party/<name>/output/<os>-<arch>.
@@ -210,7 +206,6 @@ targets.forEach { target ->
         tasks.register<BuildLibsodiumTask>(name) {
             libraryDir = tasks.named<GitClone>("cloneLibsodium").flatMap { it.localCloneDirectory }
             configureHost = target.configureHost
-            targetId = "${target.os}-${target.arch}"
             outputDir = libOutputDir.get().dir("${target.os}-${target.arch}")
             outputPath = "com/hedera/nativelib/libsodium/${target.os}/${target.arch}"
         }

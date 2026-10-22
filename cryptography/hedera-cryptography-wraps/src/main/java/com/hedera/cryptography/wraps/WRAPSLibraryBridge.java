@@ -4,6 +4,8 @@ package com.hedera.cryptography.wraps;
 import com.hedera.common.nativesupport.ResourceFile;
 import com.hedera.common.nativesupport.SingletonLoader;
 import java.io.File;
+import java.io.InputStream;
+import java.lang.System.Logger;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Set;
@@ -12,6 +14,8 @@ import java.util.Set;
  * A JNI bridge for the WRAPS 2.0 library APIs that allow participants to generate and verify recursive proofs for AddressBooks.
  */
 public class WRAPSLibraryBridge {
+    private static final Logger LOG = System.getLogger(WRAPSLibraryBridge.class.getName());
+
     /** Instance Holder for lazy loading and concurrency handling */
     private static final SingletonLoader<WRAPSLibraryBridge> INSTANCE_HOLDER =
             new SingletonLoader<>("wraps", new WRAPSLibraryBridge());
@@ -33,6 +37,50 @@ public class WRAPSLibraryBridge {
         WRAPSLibraryBridge.class.getModule().addOpens("com.hedera.cryptography.wraps", ResourceFile.class.getModule());
     }
 
+    /// A singleton used to initialize the CompressedVerifyingKey for Nova WRAPS.
+    private static class CompressedVerifyingKeyLoader {
+        private static final CompressedVerifyingKeyLoader INSTANCE = new CompressedVerifyingKeyLoader();
+        private static final String FILE_NAME = "compressed_verification_key.bin";
+
+        private final boolean loaded;
+
+        private CompressedVerifyingKeyLoader() {
+            boolean loaded = false;
+            try (InputStream resourceStream = ResourceFile.openInputStream(
+                    WRAPSLibraryBridge.class, "com/hedera/cryptography/wraps/" + FILE_NAME)) {
+                if (resourceStream == null) {
+                    LOG.log(
+                            Logger.Level.WARNING,
+                            FILE_NAME + " is missing from JAR:",
+                            new RuntimeException("capture stack trace"));
+                } else {
+                    final byte[] bytes = resourceStream.readAllBytes();
+                    if (bytes.length == 0) {
+                        LOG.log(
+                                Logger.Level.WARNING,
+                                FILE_NAME + " is empty in JAR:",
+                                new RuntimeException("capture stack trace"));
+                    } else {
+                        loaded = WRAPSLibraryBridge.loadCompressedVerifyingKey(bytes);
+                        if (!loaded) {
+                            LOG.log(
+                                    Logger.Level.WARNING,
+                                    FILE_NAME + " may be present in JAR, but failed to extract or parse:",
+                                    new RuntimeException("capture stack trace"));
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                // Catch all exceptions because we want to fail gracefully.
+                LOG.log(Logger.Level.WARNING, "Error loading " + FILE_NAME + " from JAR:", e);
+            }
+
+            this.loaded = loaded;
+        }
+    }
+
+    private static native boolean loadCompressedVerifyingKey(byte[] bytes);
+
     /// A singleton used to initialize the Public Params for Nova WRAPS.
     private static class PublicParamsLoader {
         private static final PublicParamsLoader INSTANCE = new PublicParamsLoader();
@@ -41,17 +89,32 @@ public class WRAPSLibraryBridge {
         private final boolean loaded;
 
         private PublicParamsLoader() {
-            final Path path = ResourceFile.extract(
-                            WRAPSLibraryBridge.class, "com/hedera/cryptography/wraps/" + FILE_NAME, "r--------")
-                    // Translate the file path to a path to its parent directory:
-                    .toAbsolutePath()
-                    .getParent();
+            boolean loaded = false;
+            try {
+                final Path path = ResourceFile.extract(
+                                WRAPSLibraryBridge.class, "com/hedera/cryptography/wraps/" + FILE_NAME, "r--------")
+                        // Translate the file path to a path to its parent directory:
+                        .toAbsolutePath()
+                        .getParent();
 
-            File dir = path.toFile();
-            this.loaded = dir.exists()
-                    && dir.isDirectory()
-                    && Set.of(dir.list()).contains(FILE_NAME)
-                    && WRAPSLibraryBridge.loadPublicParams(path.toString());
+                File dir = path.toFile();
+                loaded = dir.exists()
+                        && dir.isDirectory()
+                        && Set.of(dir.list()).contains(FILE_NAME)
+                        && WRAPSLibraryBridge.loadPublicParams(path.toString());
+
+                if (!loaded) {
+                    LOG.log(
+                            Logger.Level.WARNING,
+                            FILE_NAME + " may be present in JAR, but failed to extract or parse:",
+                            new RuntimeException("capture stack trace"));
+                }
+            } catch (Exception e) {
+                // Catch all exceptions because we want to fail gracefully.
+                LOG.log(Logger.Level.WARNING, "Error loading " + FILE_NAME + " from JAR:", e);
+            }
+
+            this.loaded = loaded;
         }
     }
 
@@ -71,19 +134,27 @@ public class WRAPSLibraryBridge {
     }
 
     /**
-     * Checks if proof construction and verification is potentially supported.
-     * @return true if `constructWrapsProof` and `verifyCompressedProof` are operational
+     * Checks if proof construction is potentially supported.
+     * @return true if `constructWrapsProof` is operational
      */
     public static boolean isProofSupported() {
         return PublicParamsLoader.INSTANCE.loaded;
     }
 
+    /**
+     * Checks if proof verification is potentially supported.
+     * @return true if `verifyCompressedProof` are operational
+     */
+    public static boolean isVerificationSupported() {
+        return CompressedVerifyingKeyLoader.INSTANCE.loaded;
+    }
+
     // ------------------------------------------------------------------------------------------------------
-    // DEFINITIONS BELOW MUST MATCH THEIR NATIVE CODE COUNTER-PARTS (see src/rust/wraps/src/lib.rs):
+    // DEFINITIONS BELOW MUST MATCH THEIR NATIVE CODE COUNTER-PARTS (see src/main/rust/nova-wraps/src/constants.rs):
     // ------------------------------------------------------------------------------------------------------
 
     /** The maximum size of an AddressBook. */
-    public static final int MAX_AB_SIZE = 64;
+    public static final int MAX_AB_SIZE = com.hedera.cryptography.hints.HintsLibraryBridge.MAX_SIGNERS_NUM;
 
     /** Size of a random seed. */
     public static final int ENTROPY_SIZE = 32;
@@ -511,8 +582,8 @@ public class WRAPSLibraryBridge {
      * @return true if the decider successfully verifies the proof, false if not or if errors occur
      */
     public boolean verifyCompressedProof(byte[] compressedProof, byte[] ledgerId, byte[] tssVerificationKey) {
-        // Ensure the PublicParams are loaded first.
-        if (!isProofSupported()) {
+        // Ensure the CompressedVerifyingKey is loaded first.
+        if (!isVerificationSupported()) {
             return false;
         }
         if (ledgerId == null
