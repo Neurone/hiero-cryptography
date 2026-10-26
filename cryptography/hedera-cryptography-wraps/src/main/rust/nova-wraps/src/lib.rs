@@ -7,8 +7,8 @@
 //! on how many seats it happens to fill. Rotating the committee means
 //! producing a new address book that the outgoing one has jointly signed, and the IVC
 //! carries a proof that every rotation since genesis was authorised this way.
-//! Nonidentity public keys must be unique within a book. Sentinel keys may repeat;
-//! they are omitted from the signing rounds even when selected by the bitvector.
+//! Nonidentity public keys must be unique within a book. Sentinel keys may repeat, but
+//! a bitvector may not select them as signers.
 //!
 //! Use [`WRAPS`] with the public address-book, signing, and key types.
 //! Serialized proofs and verifier keys use `Vec<u8>`.
@@ -76,10 +76,12 @@
 //! `pk_rogue := x·G − Σ pk_j` whose author can produce the joint key's signature alone.
 //! Weight bounds are checked both natively and in the circuit.
 //!
-//! What is *not* on this list is the point at infinity. An identity seat's weight is
-//! ignored by the circuit and native verification alike, in the total as well as in
-//! the signing subset, so such a seat is inert no matter who built the book — which is
-//! why address-book validation accepts one at any `u64` weight.
+//! What is *not* on this list is the point at infinity. The circuit recognises an
+//! identity seat by its key's infinity flag, which `H(ab)` commits to, not by the weight
+//! it lists: the stored weight is multiplied by `1 − is_infinity` before either sum, and
+//! point addition treats the key as the identity, so it adds nothing to the joint key.
+//! Native verification applies the same rules. Such a seat is inert no matter who built
+//! the book — which is why address-book validation accepts one at any `u64` weight.
 mod circuit;
 mod constants;
 mod error;

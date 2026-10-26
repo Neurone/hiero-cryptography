@@ -14,14 +14,15 @@ maintains a proof that every rotation since genesis was authorised that way — 
 verifier ever seeing an intermediate book or signature.
 
 Nonidentity public keys must be unique within an address book, regardless of node ID,
-weight, or proof of possession. Sentinel keys may repeat. Selected sentinel seats
-are omitted from signing rounds, so they require no commitments, nonces, or shares.
+weight, or proof of possession. Sentinel keys may repeat, but may not be selected as
+signers: `WRAPS::signing_protocol` and `WRAPS::verify_signature` return an error when
+the bitvector selects a sentinel seat.
 
 Each member's `Weight` is a `u64`. The total effective committee weight must also fit
 in a `u64`; larger totals are rejected. A strict majority is checked as
 `signing_weight > total_weight / 2`, using integer division without doubling the sum.
-Identity seats contribute zero to both sums. The circuit constrains every stored weight
-and the effective total to 64 bits.
+Identity seats contribute zero to both sums, whatever weight they list. The circuit
+constrains every stored weight and the effective total to 64 bits.
 
 Weights now serialize as 8-byte integers instead of field elements. Address-book hashes
 for previously valid 64-bit weights are unchanged. The added circuit range constraints
@@ -265,10 +266,9 @@ Aggregate. A signing key is required in R3 and is optional and ignored in R1, R2
 Aggregate. Every phase requires a valid encoded two-field rotation message, including
 R1 and R2. A signer must supply the same entropy and message throughout R1, R2, and
 R3, because both inputs determine its nonce. Every phase validates the signing book
-and rejects bits selecting seats outside that book. R2 onward also requires at least
-one selected nonidentity key.
-Round messages follow the selected nonidentity keys in address-book order, skipping
-sentinel seats even when their bit is set.
+and rejects bits selecting seats outside that book or seats keyed to the sentinel.
+R2 onward also requires at least one selected key.
+Round messages follow the selected keys in address-book order.
 
 The joint signing key must be nonidentity in both native verification and the circuit;
 otherwise its aggregate secret would be the publicly known value zero. Individual
@@ -405,10 +405,14 @@ can notice. What is at stake is the rogue-key defence: a book carrying
 `pk_rogue := x·G − Σ pk_j` lets whoever knows `x` produce the whole committee's
 signature alone.
 
-Seats keyed to the point at infinity are the exception. Their weight is ignored by the
-circuit and native verification alike — out of the total as well as out of the signing
-subset — so such a seat is inert whoever built the book. Address-book validation accepts
-repeated sentinel keys at any `u64` weight: there is no sum that weight can reach.
+Seats keyed to the point at infinity are the exception. The circuit recognises them by
+the key's infinity flag, which `H(ab)` commits to, not by the weight they list. It
+multiplies each stored weight by `1 − is_infinity` before either sum, and its point
+addition treats an infinity operand as the identity, so a selected sentinel adds nothing
+to the joint key either. Native verification applies the same rules, and native signing
+and verification also refuse a bitvector that selects such a seat. Either way the seat
+is inert whoever built the book, which is why address-book validation accepts repeated
+sentinel keys at any `u64` weight: there is no sum that weight can reach.
 
 ## Tests
 
