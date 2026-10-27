@@ -120,6 +120,9 @@ public class WRAPSLibraryBridge {
 
     private static native boolean loadPublicParams(String publicParamsPath);
 
+    /// A constant sentinel Schnorr public key, initialized lazily.
+    private byte[] sentinelPublicKey;
+
     private WRAPSLibraryBridge() {
         // private constructor to ensure singleton
     }
@@ -138,6 +141,9 @@ public class WRAPSLibraryBridge {
      * @return true if `constructWrapsProof` is operational
      */
     public static boolean isProofSupported() {
+        // Load the native library before trying to load binary files:
+        WRAPSLibraryBridge.getInstance();
+
         return PublicParamsLoader.INSTANCE.loaded;
     }
 
@@ -146,6 +152,9 @@ public class WRAPSLibraryBridge {
      * @return true if `verifyCompressedProof` are operational
      */
     public static boolean isVerificationSupported() {
+        // Load the native library before trying to load binary files:
+        WRAPSLibraryBridge.getInstance();
+
         return CompressedVerifyingKeyLoader.INSTANCE.loaded;
     }
 
@@ -192,7 +201,8 @@ public class WRAPSLibraryBridge {
 
     /**
      * Returns the deterministic sentinel (aka placeholder) Schnorr public key.
-     * The corresponding private key is unknown and cannot be obtained by design.
+     * It is the point at infinity, whose private key is the publicly known zero, so any
+     * weight its seat lists is ignored and it may not be selected as a signer.
      * @return the bytes of the sentinel Schnorr public key.
      */
     public native byte[] provideSentinelPublicKey();
@@ -211,6 +221,7 @@ public class WRAPSLibraryBridge {
      * @param weights Full AddressBook weights; must be present for phases beyond R1.
      * @param nodeIds Full AddressBook nodeIds; must be present for phases beyond R1.
      * @param signers a boolean vector of AddressBook's participants in the signing protocol.
+     *                Each signer (e.g. `true`) must have a real, non-sentinel Schnorr public key.
      * @param round1Messages Messages collected from prior rounds.
      * @param round2Messages Messages collected from prior rounds.
      * @param round3Messages Messages collected from prior rounds.
@@ -261,10 +272,22 @@ public class WRAPSLibraryBridge {
             }
         }
 
+        if (signers.length != schnorrPublicKeys.length) {
+            return null;
+        }
+
         // Round messages only come from the actual signers:
         int numOfActualSigners = 0;
-        for (boolean signer : signers) {
-            if (signer) {
+        if (this.sentinelPublicKey == null) {
+            // The content is constant, so thread races don't matter.
+            this.sentinelPublicKey = provideSentinelPublicKey();
+        }
+        for (int i = 0; i < signers.length; i++) {
+            if (signers[i]) {
+                if (Arrays.equals(this.sentinelPublicKey, schnorrPublicKeys[i])) {
+                    // API usage error: a signer must use a real, not sentinel key.
+                    return null;
+                }
                 numOfActualSigners++;
             }
         }
@@ -289,8 +312,7 @@ public class WRAPSLibraryBridge {
                     || numOfActualSigners != round1Messages.length
                     || !WRAPSLibraryBridge.validateSchnorrPublicKeys(schnorrPublicKeys)
                     || weights.length != schnorrPublicKeys.length
-                    || nodeIds.length != schnorrPublicKeys.length
-                    || signers.length != schnorrPublicKeys.length) {
+                    || nodeIds.length != schnorrPublicKeys.length) {
                 return null;
             }
         } else if (phase == SigningProtocolPhase.R3) {
@@ -304,8 +326,7 @@ public class WRAPSLibraryBridge {
                     || numOfActualSigners != round2Messages.length
                     || !WRAPSLibraryBridge.validateSchnorrPublicKeys(schnorrPublicKeys)
                     || weights.length != schnorrPublicKeys.length
-                    || nodeIds.length != schnorrPublicKeys.length
-                    || signers.length != schnorrPublicKeys.length) {
+                    || nodeIds.length != schnorrPublicKeys.length) {
                 return null;
             }
         } else if (phase == SigningProtocolPhase.Aggregate) {
@@ -323,8 +344,7 @@ public class WRAPSLibraryBridge {
                     || numOfActualSigners != round3Messages.length
                     || !WRAPSLibraryBridge.validateSchnorrPublicKeys(schnorrPublicKeys)
                     || weights.length != schnorrPublicKeys.length
-                    || nodeIds.length != schnorrPublicKeys.length
-                    || signers.length != schnorrPublicKeys.length) {
+                    || nodeIds.length != schnorrPublicKeys.length) {
                 return null;
             }
         } else {
