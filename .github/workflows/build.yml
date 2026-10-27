@@ -73,7 +73,7 @@ jobs:
 
       - name: Setup auto-tools/libtool for native builds
         run: |
-          brew install automake libtool libxslt
+          brew install automake libtool
 
       - name: Build Native Darwin
         run: ./gradlew cargoBuildX86Darwin cargoBuildAarch64Darwin buildLibsodiumDarwinArm64 buildLibsodiumDarwinAmd64 buildSecp256k1DarwinArm64 buildSecp256k1DarwinAmd64 buildXKCPDarwinArm64 buildXKCPDarwinAmd64
@@ -163,13 +163,8 @@ jobs:
         with:
           cache-read-only: false
 
-      - name: Install xsltproc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xsltproc
-
       - name: Build software
-        run: ./gradlew assemble
+        run: ./gradlew -PskipInstallRustToolchains=true assemble
 
       - name: Code Quality Checks
         run: ./gradlew -PskipInstallRustToolchains=true qualityCheck --continue
