@@ -163,6 +163,10 @@ jobs:
         with:
           cache-read-only: false
 
+      - name: Setup auto-tools/libtool for native builds
+        run: |
+          brew install automake libtool libxslt
+
       - name: Build software
         run: ./gradlew -PskipInstallRustToolchains=true assemble
 
