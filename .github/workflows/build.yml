@@ -73,7 +73,7 @@ jobs:
 
       - name: Setup auto-tools/libtool for native builds
         run: |
-          brew install automake libtool xsltproc
+          brew install automake libtool libxslt
 
       - name: Build Native Darwin
         run: ./gradlew cargoBuildX86Darwin cargoBuildAarch64Darwin buildLibsodiumDarwinArm64 buildLibsodiumDarwinAmd64 buildSecp256k1DarwinArm64 buildSecp256k1DarwinAmd64 buildXKCPDarwinArm64 buildXKCPDarwinAmd64
